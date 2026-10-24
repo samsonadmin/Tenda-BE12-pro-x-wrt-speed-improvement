@@ -1,5 +1,14 @@
 # X-WRT Speed Optimization Guide for Tenda BE12 Pro (MediaTek MT7988)
 
+> **Read [Part 2](#part-2--x-wrt-2604_b202608221937-kernel-61844) if you are on
+> X-WRT 26.04_b202608221937 or newer.**
+>
+> Part 1 below targets **X-WRT 26.04_b202606240712** (kernel 6.18.36). On the
+> newer build the `/etc/rc.local` recipe **silently stops working**: the
+> firmware's `packet_steering` service rewrites `rps_cpus` after boot and pins
+> every port back to a single CPU, which is the one setting that fixes the
+> download path. Part 2 has the corrected approach plus `install.sh`.
+
 ## Problem
 
 The Tenda BE12 Pro running **X-WRT 26.04** (kernel 6.18.36) exhibited asymmetric network throughput:
@@ -119,6 +128,12 @@ echo 2 > /sys/class/net/eth2/napi_defer_hard_irqs
 
 ## Complete `/etc/rc.local`
 
+> **On X-WRT 26.04_b202608221937 and newer this file alone is not enough** — see
+> [Part 2](#part-2--x-wrt-2604_b202608221937-kernel-61844). The `rps_cpus`
+> lines below get reverted by `/etc/init.d/packet_steering` on the next network
+> or firewall reload, and `eth0` (the DSA switch CPU port for LAN 3–5) is
+> missing from the offload list. Use `install.sh` instead.
+
 All changes are applied on boot via `/etc/rc.local`:
 
 ```bash
@@ -191,10 +206,152 @@ ethtool -k eth2 | grep -E 'generic-receive|generic-segmentation'
 # Check CPU softirq distribution
 cat /proc/softirqs | head -10
 
-# Check natflow status
+# Check natflow status (Part 1 firmware only - natflow was removed in Part 2)
 lsmod | grep natflow
 
 # Check interface statistics
 ethtool -S eth2
 ethtool -S eth1
+```
+
+---
+
+# Part 2 — X-WRT 26.04_b202608221937 (kernel 6.18.44)
+
+The guide above was written against **X-WRT 26.04_b202606240712** (kernel 6.18.36).
+This section covers the newer build, and it matters: **on the newer build the
+`/etc/rc.local` recipe above silently stops working**, because the firmware
+overwrites the RPS setting after boot.
+
+## TL;DR — why the rc.local recipe regressed
+
+`/etc/init.d/packet_steering` (START=25) runs
+`/usr/libexec/network/packet-steering.uc`, which **writes `rps_cpus` for every
+physical netdev**. It is re-triggered by:
+
+```sh
+procd_add_reload_trigger "network"
+procd_add_reload_trigger "firewall"
+procd_add_raw_trigger "interface.*" 1000 /etc/init.d/packet_steering reload
+```
+
+With `network.globals.packet_steering` unset it defaults to `1` = "Enabled
+(single CPU per device)", so it pins **all three** ethernet ports to one core:
+
+```
+eth0 rps_cpus=4     # bitmask 0x4 = CPU2 only
+eth1 rps_cpus=4
+eth2 rps_cpus=4
+```
+
+`echo f > /sys/class/net/eth2/queues/rx-0/rps_cpus` in `/etc/rc.local` runs at
+boot, but the very next network/firewall reload or interface event reverts it.
+The tuning therefore disappears at runtime — the sysctl and GRO/GSO parts
+survive (they are not managed by the firmware), but **the RPS part does not**,
+and RPS is the part that fixes the download path.
+
+Measured on the router's own `/proc/softirqs`, with identical WAN traffic:
+
+| `rps_cpus` | NET_RX on CPU0 | CPU1 | CPU2 | CPU3 |
+|---|---|---|---|---|
+| `4` (stock) | 2.5% | 0.5% | **95.5%** | 1.4% |
+| `f` (all CPUs) | 12.8% | 26.3% | 12.2% | 48.7% |
+
+## The fix — use the firmware's own knob
+
+Do not fight `packet_steering`; configure it. When `packet_steering=2`
+("Enabled (all CPUs)") the script writes `0xf` and the flow-table size itself,
+on every re-trigger:
+
+```sh
+uci set network.globals.packet_steering='2'   # LuCI: Network > Interfaces > Global
+uci set network.globals.steering_flows='2048'
+uci commit network
+/etc/init.d/packet_steering reload
+```
+
+`cpu_mask(-1)` in `packet-steering.uc` yields `(1 << ncpu) - 1` = `0xf`, and
+`rps_flow_cnt` is set from the `-l <steering_flows>` argument.
+
+## Other changes needed on the newer build
+
+**1. `natflow` no longer exists — `natcap` replaced it.**
+
+`natcap` is built into the kernel (`(O)` in `/proc/modules`), so it cannot be
+unloaded, and `/dev/natflow_ctl` is gone, which makes `/etc/init.d/natflow-boot`
+inert (its `disable_gro_gso` never runs). There are no
+`Virtual device eth2 asks to queue packet!` errors on this build, so
+`rmmod natflow` is a harmless no-op and there is no hardware offload to
+disable.
+
+**2. `eth0` had GRO/GSO off.** The original guide only covered eth1/eth2/br-lan.
+`eth0` is the DSA switch CPU port that carries LAN ports 3–5 (`lan3/4/5@eth0`),
+so traffic on those ports was doing per-packet processing.
+
+**3. Per-interface sysfs knobs die with the interface.**
+`gro_flush_timeout` and `napi_defer_hard_irqs` are per-netdev, so a WAN
+reconnect or `/etc/init.d/network reload` recreates the netdev and wipes them.
+They need to be re-applied on interface events.
+
+**4. Do not put multi-value sysctls in `/etc/sysctl.d/*.conf`.**
+X-WRT's `/etc/init.d/sysctl` runs:
+
+```sh
+cat /etc/sysctl.d/*.conf /etc/sysctl.conf | grep -v "^#" | while read line; do sysctl -qw $line; done
+```
+
+The unquoted `$line` is word-split, so `net.ipv4.tcp_rmem=4096 87380 67108864`
+becomes three arguments and the buffer is set to **4096** — catastrophically
+small. Keep the multi-value settings in an init script with proper quoting.
+
+**5. `natcap` kernel log spam.** `natcapd.default.debug=3` is `error|warn`, and
+the warn level emitted a `natcap_common_cone_out_hook()` line for every NAT
+mapping update. `debug=1` keeps errors only.
+
+## Install
+
+```sh
+scp router-speed install.sh root@192.168.1.1:/tmp/
+ssh root@192.168.1.1 'sh /tmp/install.sh'
+```
+
+`router-speed` is an init script (S96) with the same trigger set as
+`packet_steering`, so the per-interface settings are re-applied whenever the
+network stack reloads. `/etc/rc.local` is reduced to a single call into it.
+
+To undo: `scp restore-defaults.sh root@192.168.1.1:/tmp/ && ssh root@192.168.1.1 'sh /tmp/restore-defaults.sh'`
+
+## Measured result on the newer build
+
+Same router, same ISP line, alternating `rps_cpus=4` and `rps_cpus=f` between
+rounds to cancel out ISP time-of-day variance:
+
+| Test | `rps_cpus=4` (stock) | `rps_cpus=f` (fixed) | Delta |
+|---|---|---|---|
+| 50 MB serial downloads (mean) | 559 Mbps | 695 Mbps | **+24%** |
+| 50 MB serial downloads (median) | 580 Mbps | 735 Mbps | **+27%** |
+| 8 x 5 MB parallel (mean) | 923 Mbps | 1167 Mbps | **+26%** |
+| 8 x 5 MB parallel (median) | 828 Mbps | 1120 Mbps | **+35%** |
+
+The LAN-local path is unaffected (2.33 -> 2.31 Gbps on iperf3, i.e. flat at the
+2.5 Gbps line rate) — consistent with the original finding that the
+*forwarding* (download) path was the asymmetric one, not the local stack.
+
+## Diagnostic commands (newer build)
+
+```sh
+# Is RPS still pinned to one CPU? (should print f)
+cat /sys/class/net/eth2/queues/rx-0/rps_cpus
+
+# What does the firmware think packet steering should be?
+uci get network.globals.packet_steering
+
+# Who will overwrite rps_cpus next?
+grep -n "procd_add" /etc/init.d/packet_steering
+
+# natcap log level (3 = error|warn, 1 = error only)
+uci get natcapd.default.debug
+
+# Per-CPU NET_RX distribution
+grep NET_RX /proc/softirqs
 ```

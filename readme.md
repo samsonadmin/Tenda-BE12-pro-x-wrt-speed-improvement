@@ -323,15 +323,48 @@ To undo: `scp restore-defaults.sh root@192.168.1.1:/tmp/ && ssh root@192.168.1.1
 
 ## Measured result on the newer build
 
-Same router, same ISP line, alternating `rps_cpus=4` and `rps_cpus=f` between
-rounds to cancel out ISP time-of-day variance:
+Same router, same ISP line (HKT, AS4760), alternating `rps_cpus=4` and
+`rps_cpus=f` between rounds so ISP time-of-day variance hits both equally.
 
-| Test | `rps_cpus=4` (stock) | `rps_cpus=f` (fixed) | Delta |
-|---|---|---|---|
-| 50 MB serial downloads (mean) | 559 Mbps | 695 Mbps | **+24%** |
-| 50 MB serial downloads (median) | 580 Mbps | 735 Mbps | **+27%** |
-| 8 x 5 MB parallel (mean) | 923 Mbps | 1167 Mbps | **+26%** |
-| 8 x 5 MB parallel (median) | 828 Mbps | 1120 Mbps | **+35%** |
+**1. RPS redistribution (decisive, no internet quota needed):**
+
+| `rps_cpus` | NET_RX on CPU0 | CPU1 | CPU2 | CPU3 |
+|---|---|---|---|---|
+| `4` (stock) | 2.5% | 0.5% | **95.5%** | 1.4% |
+| `f` (fixed) | 24.8% | 26.1% | 24.1% | 25.1% |
+
+The single-core concentration is real and it is gone.
+
+**2. Throughput, interleaved A/B** (aliyun mirror, 4 x 50 MB streams, ~1 Gbps):
+
+| Config | n | mean | median | stdev |
+|---|---|---|---|---|
+| `rps_cpus=4` | 6 | 1045 Mbps | 1026 | 94 |
+| `rps_cpus=f` | 6 | 1059 Mbps | 1052 | 42 |
+| | | **+1.3% (t=0.33, not significant)** | | |
+
+**3. Why the gain is ~0 on this firmware.** The router is not CPU-bound:
+
+- peak aggregate CPU busy during a ~1 Gbps WAN download: **21.8%** (softirq ~10%)
+- WAN throughput plateaus at **~1,050 Mbps** whether you use 4, 8, 16 or 24 streams
+
+So there is no single-core softirq ceiling left for RPS to lift. The remaining
+gap to a 2 Gbps+ line is **not** software — it is the ISP line, the peering to
+your target, or the shared DMA engine.
+
+**Still worth doing.** The fix costs nothing measured (0.00% on iperf3) and
+removes a latent bottleneck: the moment per-flow rates or flow counts rise
+enough for one core to matter, 95% of RX work landing on a single core is the
+wrong shape to be in.
+
+> **Correction.** An earlier draft of this section quoted a +24% / +27% gain.
+> Those numbers came from a **non-interleaved** run (all of config A, then all
+> of config B) against a CDN that was rate-limiting the client IP, and they did
+> not replicate under a properly interleaved, low-variance test. The numbers
+> above supersede them. If you measured the 1,800 -> 2,200 Mbps in Part 1 with
+> a local or well-peered target, re-running the same target against the
+> `b202608221937` build would be the fair comparison — the Part 1 and Part 2
+> firmwares differ in NAT offload, not just in kernel version.
 
 The LAN-local path is unaffected (2.33 -> 2.31 Gbps on iperf3, i.e. flat at the
 2.5 Gbps line rate) — consistent with the original finding that the

@@ -1,0 +1,88 @@
+#!/bin/sh /etc/rc.common
+# router-speed - throughput tuning for Tenda BE12 Pro (MediaTek MT7988) on X-WRT.
+#
+# Keeps the WAN/LAN datapath efficient at 2.5 GbE:
+#   - GRO/GSO on every port and the bridge
+#   - NAPI deferral + GRO flush timeout on the ethernet ports
+#   - RPS spread across all 4 CPUs instead of being pinned to one
+#   - TCP/NAPI buffers sized for 2.5 Gbps
+#
+# This exists because /etc/rc.local alone is NOT enough on X-WRT:
+#   * /etc/init.d/packet_steering (S25) rewrites rps_cpus whenever the
+#     network or firewall reloads, or any interface appears/disappears.
+#   * Per-interface sysfs knobs (gro_flush_timeout, napi_defer_hard_irqs)
+#     are destroyed when an interface is recreated.
+# So the settings live here and are re-applied on those events.
+#
+# See: https://github.com/samsonadmin/Tenda-BE12-pro-x-wrt-speed-improvement
+
+START=96
+STOP=05
+USE_PROCD=1
+
+PORTS="eth0 eth1 eth2"
+BRIDGES="br-lan"
+
+apply_offload() {
+	local dev
+	for dev in $PORTS $BRIDGES; do
+		ethtool -K "$dev" gro on 2>/dev/null
+		ethtool -K "$dev" gso on 2>/dev/null
+	done
+}
+
+apply_napi() {
+	local dev
+	for dev in $PORTS; do
+		[ -e "/sys/class/net/$dev/gro_flush_timeout" ] && \
+			echo 200000 > "/sys/class/net/$dev/gro_flush_timeout" 2>/dev/null
+		[ -e "/sys/class/net/$dev/napi_defer_hard_irqs" ] && \
+			echo 2 > "/sys/class/net/$dev/napi_defer_hard_irqs" 2>/dev/null
+	done
+}
+
+apply_rps() {
+	local dev
+	for dev in $PORTS; do
+		echo f > "/sys/class/net/$dev/queues/rx-0/rps_cpus" 2>/dev/null
+		echo 2048 > "/sys/class/net/$dev/queues/rx-0/rps_flow_cnt" 2>/dev/null
+	done
+}
+
+apply_sysctl() {
+	# NOTE: keep these here, not in /etc/sysctl.d/*.conf.
+	# /etc/init.d/sysctl runs `sysctl -qw $line` with an unquoted expansion,
+	# so a multi-value entry like "net.ipv4.tcp_rmem=4096 87380 67108864"
+	# is split into three arguments and the buffer ends up at 4096.
+	sysctl -w net.ipv4.tcp_rmem='4096 87380 67108864' >/dev/null 2>&1
+	sysctl -w net.ipv4.tcp_wmem='4096 65536 67108864' >/dev/null 2>&1
+	sysctl -w net.core.netdev_budget=600 >/dev/null 2>&1
+	sysctl -w net.core.dev_weight=128 >/dev/null 2>&1
+	sysctl -w net.core.netdev_max_backlog=10000 >/dev/null 2>&1
+	sysctl -w net.core.rps_sock_flow_entries=2048 >/dev/null 2>&1
+}
+
+apply_speed() {
+	# The natflow hardware offload is not present on X-WRT 26.04 (natcap
+	# replaced it) - keep the rmmod for older firmware, it is a no-op here.
+	rmmod natflow 2>/dev/null
+
+	apply_offload
+	apply_napi
+	apply_rps
+	apply_sysctl
+}
+
+start_service() {
+	reload_service
+}
+
+reload_service() {
+	apply_speed
+}
+
+service_triggers() {
+	procd_add_reload_trigger "network"
+	procd_add_reload_trigger "firewall"
+	procd_add_raw_trigger "interface.*" 1000 /etc/init.d/router-speed reload
+}
